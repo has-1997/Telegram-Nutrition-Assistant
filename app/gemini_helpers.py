@@ -295,3 +295,4 @@ if __name__ == "__main__":
     # print("Estimated protein:", protein)
 
     # For voice and image tests, you would pass real file paths from your downloads/ folder.
+    pass

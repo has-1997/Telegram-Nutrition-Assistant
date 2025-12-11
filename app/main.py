@@ -18,8 +18,14 @@ from sheets_helpers import (
     get_profile_by_user_id,
     create_profile,
 )
-from gemini_helpers import estimate_calorie_and_protein_targets
-
+from gemini_helpers import (
+    estimate_calorie_and_protein_targets,
+    transcribe_voice_message,
+)
+from media_helpers import (
+    download_voice_file,
+    download_photo_file,
+)
 
 # Set up basic logging so we can see what's happening in the terminal
 logging.basicConfig(
@@ -32,7 +38,9 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+
 # --------------------- COMMAND HANDLER ---------------------
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -47,7 +55,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     profile = get_profile_by_user_id(chat_id)
 
     if profile is None:
-
         # New user: invite them to register
         context.user_data.clear()
         context.user_data["mode"] = "registration"
@@ -69,12 +76,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         await update.message.reply_text(
             f"Welcome back, *{name}* 💪\n\n"
-            "You’re already registered. Tell me about your meals or ask for a daily report.",
+            "You’re already registered. "
+            "Send me meal descriptions, photos, or voice messages, "
+            "or ask for a daily report.",
             parse_mode="Markdown",
         )
 
 
 # --------------------- TEXT ROUTING ---------------------
+
 
 async def handle_text_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -90,20 +100,21 @@ async def handle_text_message(
 
     chat_id = update.effective_chat.id
     user_text = (update.message.text or "").strip()
-    logger.info("Received text from chat_id=%s: %s", chat_id, user_text)
+    logger.info("Received TEXT from chat_id=%s: %s", chat_id, user_text)
 
     profile = get_profile_by_user_id(chat_id)
 
     if profile is None:
-        # Green zone: not registered yet → go to registration assistant
+        # Not registered yet → go to registration assistant
         context.user_data.setdefault("mode", "registration")
         await registration_assistant(update, context)
     else:
-        # Green zone: already registered → go to main nutrition agent
+        # Already registered → go to main nutrition agent
         context.user_data["mode"] = "main"
-        await main_nutrition_agent(update, context, profile)
+        await main_nutrition_agent(update, context, profile, user_text)
 
-# --------------------- VOICE ROUTING (placeholder) ---------------------
+
+# --------------------- VOICE ROUTING (with Gemini) ---------------------
 
 
 async def handle_voice_message(
@@ -113,7 +124,10 @@ async def handle_voice_message(
     Behavior:
         - Runs when the user sends a voice message.
         - If not registered → ask them to run /start.
-        - If registered → acknowledge voice and (later) send to Gemini for transcription.
+        - If registered:
+            - Download the audio file.
+            - Send it to Gemini to get a text transcription.
+            - Pass that text to the main nutrition agent as if user typed it.
     """
     if update.message is None:
         return
@@ -132,15 +146,47 @@ async def handle_voice_message(
         )
         return
 
-    # Registered user – placeholder behavior for now
-    await update.message.reply_text(
-        "🎙 I got your voice message!\n\n"
-        "Soon I’ll listen to it, figure out what you ate, and log it as a meal.\n"
-        "For now this is just a test that voice routing works ✅",
+    # Download the voice note locally
+    local_path = await download_voice_file(update, context)
+    if local_path is None:
+        await update.message.reply_text(
+            "It was not possible to process the file. "
+            "File type not supported or download failed 😕",
+        )
+        return
+
+    # Ask Gemini to turn audio into text
+    try:
+        transcribed_text = transcribe_voice_message(
+            audio_path=local_path,
+            mime_type="audio/ogg",
+        )
+    except Exception as e:
+        logger.exception("Error while transcribing voice message: %s", e)
+        await update.message.reply_text(
+            "Something went wrong while processing your voice message 😔\n"
+            "Please try again, or send it as text instead.",
+        )
+        return
+
+    if not transcribed_text.strip():
+        await update.message.reply_text(
+            "I couldn’t understand that voice message clearly 😕\n"
+            "Could you repeat it or send it as text?",
+        )
+        return
+
+    # Now treat the transcribed text just like a normal message
+    logger.info(
+        "Transcribed VOICE from chat_id=%s into TEXT: %s",
+        chat_id,
+        transcribed_text,
     )
+    context.user_data["mode"] = "main"
+    await main_nutrition_agent(update, context, profile, transcribed_text)
 
 
-# --------------------- PHOTO ROUTING (placeholder) ---------------------
+# --------------------- PHOTO ROUTING (still placeholder) ---------------------
 
 
 async def handle_photo_message(
@@ -150,7 +196,7 @@ async def handle_photo_message(
     Behavior:
         - Runs when the user sends a photo.
         - If not registered → ask them to run /start.
-        - If registered → acknowledge photo and (later) send to Gemini for food analysis.
+        - If registered → placeholder for now. We'll analyze the photo later.
     """
     if update.message is None:
         return
@@ -169,14 +215,16 @@ async def handle_photo_message(
         )
         return
 
-    # Registered user – placeholder behavior for now
+    # Placeholder for now – we'll hook in analyze_meal_image soon
     await update.message.reply_text(
         "🍽 I got your meal photo!\n\n"
         "Soon I’ll estimate calories, protein, carbs and fats from your plate.\n"
         "For now this is just a test that photo routing works ✅",
     )
 
+
 # --------------------- REGISTRATION ASSISTANT ---------------------
+
 
 async def registration_assistant(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -463,25 +511,28 @@ async def registration_assistant(
         return
 
 
-# --------------------- MAIN NUTRITION AGENT (placeholder) ---------------------
+# --------------------- MAIN NUTRITION AGENT (still placeholder) ---------------------
+
 
 async def main_nutrition_agent(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     profile: dict,
+    message_text: str,
 ) -> None:
     """
-    Temporary placeholder.
-    Behavior now:
+    Behavior (for now):
         - Confirms we’re in the main nutrition side.
+        - Shows the text it thinks the user sent (typed or transcribed).
     Later:
         - Will log meals, update targets, and show daily reports.
     """
     name = profile.get("Name") or "champ"
     await update.message.reply_text(
         f"🏋️ Main nutrition coach here, *{name}*.\n\n"
-        "Soon I’ll log meals, update your targets, and show daily reports.\n"
-        "For now, this is just a placeholder reply.",
+        "Here’s the message I’m working with:\n"
+        f"“{message_text}”\n\n"
+        "(Soon I’ll turn messages like this into logged meals, profile updates, or reports.)",
         parse_mode="Markdown",
     )
 
@@ -517,10 +568,9 @@ def main() -> None:
     # Photo messages
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
 
-    print("✅ Cal AI bot is running with text + voice + photo routing.")
+    print("✅ Cal AI bot is running with text + voice (transcribed) + photo routing.")
     application.run_polling()
 
 
-# This runs when you do: python main.py
 if __name__ == "__main__":
     main()
