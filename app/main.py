@@ -3,6 +3,7 @@
 import os
 import logging
 from typing import Dict, Any
+from datetime import datetime
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -17,10 +18,12 @@ from telegram.ext import (
 from sheets_helpers import (
     get_profile_by_user_id,
     create_profile,
+    append_meal_row,
 )
 from gemini_helpers import (
     estimate_calorie_and_protein_targets,
     transcribe_voice_message,
+    analyze_meal_image,
 )
 from media_helpers import (
     download_voice_file,
@@ -37,6 +40,15 @@ logger = logging.getLogger(__name__)
 # Load variables from the .env file
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+
+def today_str() -> str:
+    """
+    Inputs: none.
+    Returns: today's date as 'YYYY-MM-DD'.
+    Purpose: use a consistent date format for meal logging.
+    """
+    return datetime.utcnow().strftime("%Y-%m-%d")
 
 
 # --------------------- COMMAND HANDLER ---------------------
@@ -76,7 +88,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         await update.message.reply_text(
             f"Welcome back, *{name}* 💪\n\n"
-            "You’re already registered. "
+            "You’re already registered.\n"
             "Send me meal descriptions, photos, or voice messages, "
             "or ask for a daily report.",
             parse_mode="Markdown",
@@ -186,7 +198,7 @@ async def handle_voice_message(
     await main_nutrition_agent(update, context, profile, transcribed_text)
 
 
-# --------------------- PHOTO ROUTING (still placeholder) ---------------------
+# --------------------- PHOTO ROUTING (with Gemini meal analysis) ---------------------
 
 
 async def handle_photo_message(
@@ -196,7 +208,11 @@ async def handle_photo_message(
     Behavior:
         - Runs when the user sends a photo.
         - If not registered → ask them to run /start.
-        - If registered → placeholder for now. We'll analyze the photo later.
+        - If registered:
+            - Download the photo.
+            - Ask Gemini to analyze the meal and estimate macros.
+            - Log a new row in the Meals sheet for today.
+            - Reply with a summary of what was logged.
     """
     if update.message is None:
         return
@@ -215,12 +231,79 @@ async def handle_photo_message(
         )
         return
 
-    # Placeholder for now – we'll hook in analyze_meal_image soon
-    await update.message.reply_text(
-        "🍽 I got your meal photo!\n\n"
-        "Soon I’ll estimate calories, protein, carbs and fats from your plate.\n"
-        "For now this is just a test that photo routing works ✅",
+    # 1) Download the photo locally
+    local_path = await download_photo_file(update, context)
+    if local_path is None:
+        await update.message.reply_text(
+            "It was not possible to process the file. "
+            "File type not supported or download failed 😕",
+        )
+        return
+
+    # 2) Ask Gemini to analyze the image
+    try:
+        analysis = analyze_meal_image(
+            image_path=local_path,
+            mime_type="image/jpeg",  # Telegram photos are usually JPEG
+        )
+    except Exception as e:
+        logger.exception("Error while analyzing meal image: %s", e)
+        await update.message.reply_text(
+            "Something went wrong while analyzing that meal photo 😔\n"
+            "Please try again, or describe the meal in text.",
+        )
+        return
+
+    meal_description = analysis.get("meal_description", "Meal")
+    calories = float(analysis.get("calories", 0))
+    proteins = float(analysis.get("proteins", 0))
+    carbs = float(analysis.get("carbs", 0))
+    fats = float(analysis.get("fats", 0))
+
+    # 3) Log the meal in the Meals sheet with today's date
+    date_str = today_str()
+    logger.info(
+        "Logging meal from photo for chat_id=%s on %s: %s (kcal=%.1f, P=%.1f, C=%.1f, F=%.1f)",
+        chat_id,
+        date_str,
+        meal_description,
+        calories,
+        proteins,
+        carbs,
+        fats,
     )
+
+    try:
+        append_meal_row(
+            user_id=chat_id,
+            date_str=date_str,
+            meal_description=meal_description,
+            calories=calories,
+            proteins=proteins,
+            carbs=carbs,
+            fats=fats,
+        )
+    except Exception as e:
+        logger.exception("Error while appending meal row: %s", e)
+        await update.message.reply_text(
+            "I analyzed your meal, but something went wrong while saving it 😔\n"
+            "Please try again in a moment.",
+        )
+        return
+
+    # 4) Reply to the user with a friendly summary
+    reply_text = (
+        "🍽 Meal logged from your photo!\n\n"
+        f"Description: {meal_description}\n"
+        f"🔥 Calories: ~{int(calories)} kcal\n"
+        f"🍗 Protein: ~{int(proteins)} g\n"
+        f"🍞 Carbs: ~{int(carbs)} g\n"
+        f"🥑 Fats: ~{int(fats)} g\n\n"
+        "I’ve added this to today’s log.\n"
+        "You can ask me for a *daily report* any time to see your totals 📊"
+    )
+
+    await update.message.reply_text(reply_text, parse_mode="Markdown")
 
 
 # --------------------- REGISTRATION ASSISTANT ---------------------
@@ -511,7 +594,7 @@ async def registration_assistant(
         return
 
 
-# --------------------- MAIN NUTRITION AGENT (still placeholder) ---------------------
+# --------------------- MAIN NUTRITION AGENT (still simple) ---------------------
 
 
 async def main_nutrition_agent(
@@ -568,7 +651,9 @@ def main() -> None:
     # Photo messages
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
 
-    print("✅ Cal AI bot is running with text + voice (transcribed) + photo routing.")
+    print(
+        "✅ Cal AI bot is running with text + voice (transcribed) + photo meal logging."
+    )
     application.run_polling()
 
 
