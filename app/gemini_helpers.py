@@ -2,14 +2,10 @@
 
 import os
 import json
-import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 from dotenv import load_dotenv
-from google.genai import Client
-from google.genai import types
-
-logger = logging.getLogger(__name__)
+from google.genai import Client, types
 
 # Load .env so we can read GEMINI_API_KEY
 load_dotenv()
@@ -49,10 +45,10 @@ def ask_gemini_text(prompt: str, model_name: str = "gemini-2.5-flash") -> str:
         model=model_name,
         contents=prompt,
     )
-
-    # response.text is a convenient shortcut to the main text
     return response.text or ""
 
+
+# ---------- TARGET ESTIMATION (TEXT-ONLY) ----------
 
 def estimate_calorie_and_protein_targets(
     weight_kg: float,
@@ -69,7 +65,7 @@ def estimate_calorie_and_protein_targets(
     Returns:
         (calories_target, protein_target) as floats.
     Purpose:
-        Ask Gemini to act like a nutrition coach and pick daily targets.
+        Ask Gemini to act like a nutrition coach and pick sensible daily targets.
         Uses structured output to ensure valid JSON response.
     """
     prompt = f"""You are an experienced sports nutrition coach.
@@ -119,22 +115,183 @@ Based on standard sports nutrition guidelines, choose sensible daily targets for
         calories = float(data["calories_target"])
         protein = float(data["protein_target"])
         return calories, protein
-    except (KeyError, ValueError, json.JSONDecodeError, AttributeError) as e:
+    except (KeyError, ValueError, json.JSONDecodeError, AttributeError):
         # Fallback if parsing fails: simple heuristic
         # Rough defaults: 30 kcal/kg and 1.8 g protein/kg
-        logger.warning(f"Failed to parse structured response: {e}. Using fallback values.")
         calories = weight_kg * 30.0
         protein = weight_kg * 1.8
         return calories, protein
 
 
-if __name__ == "__main__":
-    # Tiny manual test; this will use an API call.
-    cals, protein = estimate_calorie_and_protein_targets(
-        weight_kg=90,
-        height_cm=173,
-        age_years=28,
-        goal="gain muscle",
+# ---------- VOICE → TEXT HELPER ----------
+
+def transcribe_voice_message(
+    audio_path: str,
+    mime_type: str = "audio/ogg",
+    model_name: str = "gemini-2.5-flash",
+) -> str:
+    """
+    Inputs:
+        audio_path: local path to the downloaded audio file.
+        mime_type: MIME type for the audio (Telegram voice is usually audio/ogg).
+        model_name: Gemini model to use.
+    Returns:
+        A short text message that represents what the user said,
+        phrased as if they had typed it directly.
+    Purpose:
+        Turn a Telegram voice note into a normal text message for the bot.
+    """
+    client = _get_client()
+
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+
+    prompt = """You are helping a nutrition coach bot on Telegram.
+
+You will receive an audio message from a user talking about their food,
+their day, or asking nutrition questions.
+
+Task:
+1. Understand what the user said.
+2. Rewrite it as a single, clear text message as if the user had typed it.
+3. Do NOT say "they said" or "user said" – just write the message content.
+4. If they mention food they ate, keep those details.
+
+Return plain text only, no bullet points, no JSON."""
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[
+            types.Part.from_text(text=prompt),
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+        ],
     )
-    print("Estimated calories:", cals)
-    print("Estimated protein:", protein)
+
+    return response.text or ""
+
+
+# ---------- MEAL PHOTO → MACROS HELPER ----------
+
+def analyze_meal_image(
+    image_path: str,
+    mime_type: str = "image/jpeg",
+    model_name: str = "gemini-2.5-flash",
+) -> Dict[str, Any]:
+    """
+    Inputs:
+        image_path: local path to the downloaded meal photo.
+        mime_type: MIME type for the image (Telegram photos are usually JPEG).
+        model_name: Gemini model to use.
+    Returns:
+        A dict with keys:
+            - meal_description (str)
+            - calories (float)
+            - proteins (float)
+            - carbs (float)
+            - fats (float)
+    Purpose:
+        Look at a plate of food and estimate macros in a structured way.
+        Uses structured output to ensure valid JSON response.
+    """
+    client = _get_client()
+
+    with open(image_path, "rb") as f:
+        image_bytes = f.read()
+
+    prompt = """You are a nutrition vision assistant.
+
+You will see a photo of a meal. Your job:
+1. Identify the main components of the meal (foods).
+2. Estimate reasonable portion sizes.
+3. Use typical macro values per 100 g to estimate:
+   - total calories
+   - grams of protein
+   - grams of carbs
+   - grams of fats
+
+Provide a short description of the meal and the macro estimates."""
+
+    # Define the JSON schema for structured output
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "meal_description": {
+                "type": "string",
+                "description": "Short human-readable description of the meal (max 2 sentences)"
+            },
+            "calories": {
+                "type": "integer",
+                "description": "Estimated total calories"
+            },
+            "proteins": {
+                "type": "integer",
+                "description": "Estimated grams of protein"
+            },
+            "carbs": {
+                "type": "integer",
+                "description": "Estimated grams of carbohydrates"
+            },
+            "fats": {
+                "type": "integer",
+                "description": "Estimated grams of fats"
+            }
+        },
+        "required": ["meal_description", "calories", "proteins", "carbs", "fats"]
+    }
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[
+            types.Part.from_text(text=prompt),
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=response_schema,
+        ),
+    )
+
+    try:
+        # Use the parsed response if available (structured output)
+        if response.parsed and isinstance(response.parsed, dict):
+            data = response.parsed
+        else:
+            # Fallback to parsing text if parsed is not available
+            data = json.loads(response.text)
+        
+        meal_description = str(data.get("meal_description", "")).strip()
+        calories = float(data.get("calories", 0))
+        proteins = float(data.get("proteins", 0))
+        carbs = float(data.get("carbs", 0))
+        fats = float(data.get("fats", 0))
+    except (KeyError, ValueError, json.JSONDecodeError, AttributeError):
+        # Fallback if parsing fails
+        meal_description = "Meal (details could not be parsed)."
+        calories = proteins = carbs = fats = 0.0
+
+    return {
+        "meal_description": meal_description,
+        "calories": calories,
+        "proteins": proteins,
+        "carbs": carbs,
+        "fats": fats,
+    }
+
+
+if __name__ == "__main__":
+    # Optional manual tests (each will use an API call if you uncomment them).
+
+    # 1) Simple greeting
+    # print(ask_gemini_text("Say hi in one short sentence."))
+
+    # 2) Example targets
+    # cals, protein = estimate_calorie_and_protein_targets(
+    #     weight_kg=75,
+    #     height_cm=180,
+    #     age_years=28,
+    #     goal="gain muscle",
+    # )
+    # print("Estimated calories:", cals)
+    # print("Estimated protein:", protein)
+
+    # For voice and image tests, you would pass real file paths from your downloads/ folder.
