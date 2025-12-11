@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# --------------------- COMMAND HANDLER ---------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -73,6 +74,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+# --------------------- TEXT ROUTING ---------------------
+
 async def handle_text_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -100,6 +103,80 @@ async def handle_text_message(
         context.user_data["mode"] = "main"
         await main_nutrition_agent(update, context, profile)
 
+# --------------------- VOICE ROUTING (placeholder) ---------------------
+
+
+async def handle_voice_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Behavior:
+        - Runs when the user sends a voice message.
+        - If not registered → ask them to run /start.
+        - If registered → acknowledge voice and (later) send to Gemini for transcription.
+    """
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    logger.info("Received VOICE from chat_id=%s", chat_id)
+
+    profile = get_profile_by_user_id(chat_id)
+
+    if profile is None:
+        await update.message.reply_text(
+            "Hey legend 👋\n\n"
+            "Before I can understand your voice messages, "
+            "I need to know who you are.\n"
+            "Please send /start and complete the quick setup first 💪",
+        )
+        return
+
+    # Registered user – placeholder behavior for now
+    await update.message.reply_text(
+        "🎙 I got your voice message!\n\n"
+        "Soon I’ll listen to it, figure out what you ate, and log it as a meal.\n"
+        "For now this is just a test that voice routing works ✅",
+    )
+
+
+# --------------------- PHOTO ROUTING (placeholder) ---------------------
+
+
+async def handle_photo_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Behavior:
+        - Runs when the user sends a photo.
+        - If not registered → ask them to run /start.
+        - If registered → acknowledge photo and (later) send to Gemini for food analysis.
+    """
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    logger.info("Received PHOTO from chat_id=%s", chat_id)
+
+    profile = get_profile_by_user_id(chat_id)
+
+    if profile is None:
+        await update.message.reply_text(
+            "Hey champ 📸\n\n"
+            "Before I can analyze your food photos, "
+            "I need to set up your profile.\n"
+            "Please send /start and complete the quick setup first 💪",
+        )
+        return
+
+    # Registered user – placeholder behavior for now
+    await update.message.reply_text(
+        "🍽 I got your meal photo!\n\n"
+        "Soon I’ll estimate calories, protein, carbs and fats from your plate.\n"
+        "For now this is just a test that photo routing works ✅",
+    )
+
+# --------------------- REGISTRATION ASSISTANT ---------------------
 
 async def registration_assistant(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -386,6 +463,8 @@ async def registration_assistant(
         return
 
 
+# --------------------- MAIN NUTRITION AGENT (placeholder) ---------------------
+
 async def main_nutrition_agent(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -407,12 +486,15 @@ async def main_nutrition_agent(
     )
 
 
+# --------------------- APP ENTRY POINT ---------------------
+
+
 def main() -> None:
     """
     Behavior:
         - Checks for the bot token
         - Creates the Telegram application
-        - Registers handlers
+        - Registers handlers (text, voice, photo)
         - Starts long polling (listening for messages)
     """
     if not TELEGRAM_BOT_TOKEN:
@@ -421,15 +503,21 @@ def main() -> None:
     # Build the bot application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Register the /start command handler
+    # /start command
     application.add_handler(CommandHandler("start", start))
 
-    # Register a handler for all plain text messages (that are not commands)
+    # Text messages (not commands)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
 
-    print("✅ Cal AI bot is running with basic routing.")
+    # Voice messages
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+
+    # Photo messages
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+
+    print("✅ Cal AI bot is running with text + voice + photo routing.")
     application.run_polling()
 
 
