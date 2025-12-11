@@ -18,6 +18,7 @@ from sheets_helpers import (
     get_profile_by_user_id,
     create_profile,
 )
+from gemini_helpers import estimate_calorie_and_protein_targets
 
 
 # Set up basic logging so we can see what's happening in the terminal
@@ -108,8 +109,14 @@ async def registration_assistant(
         Step-based registration flow:
         - ask_name → store name
         - ask_know_targets → do they already know calories/protein?
-        - ask_calories_target → numeric calories
-        - ask_protein_target → numeric protein, then create profile
+        - if yes:
+            - ask_calories_target → numeric calories
+            - ask_protein_target → numeric protein, then create profile
+        - if no:
+            - ask_weight → kg
+            - ask_height → cm
+            - ask_age → years
+            - ask_goal → text; use Gemini to estimate targets and create profile
     """
     if update.message is None:
         return
@@ -130,7 +137,6 @@ async def registration_assistant(
             "Reply with **yes** or **no**.",
             parse_mode="Markdown",
         )
-
         return
 
     # Step 2: Ask if they know their targets
@@ -149,16 +155,15 @@ async def registration_assistant(
             return
         elif text_lower in {"no", "n", "nope", "nah"}:
             data["knows_targets"] = False
-            # We'll handle the 'I don't know' path with Gemini later
+            context.user_data["registration_step"] = "ask_weight"
+
             await update.message.reply_text(
                 "No problem at all 💪\n\n"
-                "In a later step I’ll help you *calculate* good targets based on your stats.\n"
-                "For now, please answer as if you **do** know them so we can finish wiring the flow.\n\n"
-                "So, pretend you have a number and send your *daily calorie target* as a **number only**.\n"
-                "Example: `2200`",
+                "I’ll help you *calculate* good targets based on your stats.\n\n"
+                "First, what’s your *weight in kg*?\n"
+                "Example: `75`",
                 parse_mode="Markdown",
             )
-            context.user_data["registration_step"] = "ask_calories_target"
             return
         else:
             await update.message.reply_text(
@@ -167,7 +172,9 @@ async def registration_assistant(
             )
             return
 
-    # Step 3: Ask for calories target
+    # ----- PATH A: USER KNOWS TARGETS -----
+
+    # Step 3A: Ask for calories target
     if step == "ask_calories_target":
         try:
             calories = float(user_text)
@@ -189,7 +196,7 @@ async def registration_assistant(
         )
         return
 
-    # Step 4: Ask for protein target and create profile
+    # Step 4A: Ask for protein target and create profile
     if step == "ask_protein_target":
         try:
             protein = float(user_text)
@@ -208,7 +215,7 @@ async def registration_assistant(
         protein_target = data["protein_target"]
 
         logger.info(
-            "Creating profile for chat_id=%s name=%s calories=%s protein=%s",
+            "Creating profile (manual targets) for chat_id=%s name=%s calories=%s protein=%s",
             chat_id,
             name,
             calories_target,
@@ -234,11 +241,148 @@ async def registration_assistant(
             "From now on you can:\n"
             "• Send me meal descriptions or photos to log your food 🥗\n"
             "• Ask for a *daily report* to see your progress 📊\n"
-            "• Later, we’ll let you update your targets any time.\n\n"
+            "• Update your targets any time.\n\n"
             "Whenever you're ready, tell me about your next meal!",
             parse_mode="Markdown",
         )
-        
+        return
+
+    # ----- PATH B: USER DOES NOT KNOW TARGETS (USE GEMINI) -----
+
+    # Step 3B: Ask for weight
+    if step == "ask_weight":
+        try:
+            weight = float(user_text)
+        except ValueError:
+            await update.message.reply_text(
+                "I need a *number only* for your weight in kg 🔢\n" "Example: `75`",
+                parse_mode="Markdown",
+            )
+            return
+
+        data["weight_kg"] = weight
+        context.user_data["registration_step"] = "ask_height"
+
+        await update.message.reply_text(
+            "Nice ⚖️\n\n" "What’s your *height in cm*?\n" "Example: `180`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Step 4B: Ask for height
+    if step == "ask_height":
+        try:
+            height = float(user_text)
+        except ValueError:
+            await update.message.reply_text(
+                "I need a *number only* for your height in cm 🔢\n" "Example: `180`",
+                parse_mode="Markdown",
+            )
+            return
+
+        data["height_cm"] = height
+        context.user_data["registration_step"] = "ask_age"
+
+        await update.message.reply_text(
+            "Got it 📏\n\n" "How old are you (in *years*)?\n" "Example: `28`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Step 5B: Ask for age
+    if step == "ask_age":
+        try:
+            age = int(user_text)
+        except ValueError:
+            await update.message.reply_text(
+                "I need a *whole number* for your age in years 🔢\n" "Example: `28`",
+                parse_mode="Markdown",
+            )
+            return
+
+        data["age_years"] = age
+        context.user_data["registration_step"] = "ask_goal"
+
+        await update.message.reply_text(
+            "Perfect 🎯\n\n"
+            "Finally, what’s your main goal?\n"
+            "You can say things like:\n"
+            "• gain muscle\n"
+            "• lose fat\n"
+            "• maintain\n",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Step 6B: Ask for goal, call Gemini, create profile
+    if step == "ask_goal":
+        goal_text = user_text.lower()
+        data["goal_raw"] = goal_text
+
+        # Normalize the goal into one of three categories for the prompt
+        if "gain" in goal_text or "bulk" in goal_text or "muscle" in goal_text:
+            goal_norm = "gain muscle"
+        elif "lose" in goal_text or "cut" in goal_text or "fat" in goal_text:
+            goal_norm = "lose fat"
+        else:
+            goal_norm = "maintain"
+
+        weight = float(data["weight_kg"])
+        height = float(data["height_cm"])
+        age = int(data["age_years"])
+
+        await update.message.reply_text(
+            "Love that goal 🙌\n\n"
+            "Give me a second while I calculate smart daily targets for you… 🤖",
+            parse_mode="Markdown",
+        )
+
+        # Ask Gemini for calorie & protein targets
+        calories_target, protein_target = estimate_calorie_and_protein_targets(
+            weight_kg=weight,
+            height_cm=height,
+            age_years=age,
+            goal=goal_norm,
+        )
+
+        name = data.get("name", "champ")
+
+        logger.info(
+            "Creating profile (Gemini targets) for chat_id=%s name=%s "
+            "weight=%.2f height=%.2f age=%d goal=%s calories=%.2f protein=%.2f",
+            chat_id,
+            name,
+            weight,
+            height,
+            age,
+            goal_norm,
+            calories_target,
+            protein_target,
+        )
+
+        create_profile(
+            user_id=chat_id,
+            name=name,
+            calories_target=calories_target,
+            protein_target=protein_target,
+        )
+
+        # Clear registration state & switch to main mode
+        context.user_data.clear()
+        context.user_data["mode"] = "main"
+
+        await update.message.reply_text(
+            "Targets calculated and locked in, legend 💪\n\n"
+            f"Here’s what I recommend based on your stats and goal:\n"
+            f"🔥 *{int(calories_target)}* kcal per day\n"
+            f"🍗 *{int(protein_target)}* g protein per day\n\n"
+            "From now on you can:\n"
+            "• Send me meal descriptions or photos to log your food 🥗\n"
+            "• Ask for a *daily report* to see your progress 📊\n"
+            "• Update your targets any time as things change.\n\n"
+            "Whenever you're ready, tell me about your next meal!",
+            parse_mode="Markdown",
+        )
         return
 
 
