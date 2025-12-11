@@ -2,6 +2,7 @@
 
 import os
 import logging
+from typing import Dict, Any
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -13,7 +14,10 @@ from telegram.ext import (
     filters,
 )
 
-from sheets_helpers import get_profile_by_user_id  # our Google Sheets helper
+from sheets_helpers import (
+    get_profile_by_user_id,
+    create_profile,
+)
 
 
 # Set up basic logging so we can see what's happening in the terminal
@@ -41,7 +45,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     profile = get_profile_by_user_id(chat_id)
 
     if profile is None:
+
         # New user: invite them to register
+        context.user_data.clear()
+        context.user_data["mode"] = "registration"
+        context.user_data["registration_step"] = "ask_name"
+        context.user_data["registration_data"] = {}
+
         await update.message.reply_text(
             "🔥 Welcome to *Cal AI* – your nutrition assistant!\n\n"
             "Looks like this is your first time here.\n"
@@ -49,18 +59,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "First question: what’s your *first name*, champ? 💪",
             parse_mode="Markdown",
         )
-        # Mark that we're in registration mode for this user
-        context.user_data["mode"] = "registration"
-        context.user_data["registration_step"] = "ask_name"
     else:
         # Returning user: greet them with their name if we have it
         name = profile.get("Name") or "champ"
+        context.user_data.clear()
+        context.user_data["mode"] = "main"
+
         await update.message.reply_text(
             f"Welcome back, *{name}* 💪\n\n"
             "You’re already registered. Tell me about your meals or ask for a daily report.",
             parse_mode="Markdown",
         )
-        context.user_data["mode"] = "main"
 
 
 async def handle_text_message(
@@ -76,7 +85,7 @@ async def handle_text_message(
         return
 
     chat_id = update.effective_chat.id
-    user_text = update.message.text or ""
+    user_text = (update.message.text or "").strip()
     logger.info("Received text from chat_id=%s: %s", chat_id, user_text)
 
     profile = get_profile_by_user_id(chat_id)
@@ -95,18 +104,142 @@ async def registration_assistant(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """
-    Temporary placeholder.
-    Behavior now:
-        - Just confirms we’re in the registration side.
-    Later:
-        - We’ll expand this to ask name, goals, targets, etc.,
-          and write to the Profile sheet.
+    Behavior:
+        Step-based registration flow:
+        - ask_name → store name
+        - ask_know_targets → do they already know calories/protein?
+        - ask_calories_target → numeric calories
+        - ask_protein_target → numeric protein, then create profile
     """
-    await update.message.reply_text(
-        "🧾 Registration assistant here.\n\n"
-        "We’ll soon ask your name and nutrition goals and save them.\n"
-        "For now, this is just a placeholder so routing works.",
-    )
+    if update.message is None:
+        return
+
+    chat_id = update.effective_chat.id
+    user_text = (update.message.text or "").strip()
+    data: Dict[str, Any] = context.user_data.setdefault("registration_data", {})
+    step = context.user_data.get("registration_step", "ask_name")
+
+    # Step 1: Ask for name
+    if step == "ask_name":
+        data["name"] = user_text
+        context.user_data["registration_step"] = "ask_know_targets"
+
+        await update.message.reply_text(
+            f"Nice to meet you, {data['name']} 😎\n\n"
+            "Do you already know your daily *calorie* and *protein* targets?\n"
+            "Reply with **yes** or **no**.",
+            parse_mode="Markdown",
+        )
+
+        return
+
+    # Step 2: Ask if they know their targets
+    if step == "ask_know_targets":
+        text_lower = user_text.lower()
+        if text_lower in {"yes", "y", "yeah", "yep", "sure"}:
+            data["knows_targets"] = True
+            context.user_data["registration_step"] = "ask_calories_target"
+
+            await update.message.reply_text(
+                "Awesome 🔥\n\n"
+                "Please send your *daily calorie target* as a **number only**.\n"
+                "Example: `2200`",
+                parse_mode="Markdown",
+            )
+            return
+        elif text_lower in {"no", "n", "nope", "nah"}:
+            data["knows_targets"] = False
+            # We'll handle the 'I don't know' path with Gemini later
+            await update.message.reply_text(
+                "No problem at all 💪\n\n"
+                "In a later step I’ll help you *calculate* good targets based on your stats.\n"
+                "For now, please answer as if you **do** know them so we can finish wiring the flow.\n\n"
+                "So, pretend you have a number and send your *daily calorie target* as a **number only**.\n"
+                "Example: `2200`",
+                parse_mode="Markdown",
+            )
+            context.user_data["registration_step"] = "ask_calories_target"
+            return
+        else:
+            await update.message.reply_text(
+                "Please reply with **yes** or **no** so I know whether you already have targets 😊",
+                parse_mode="Markdown",
+            )
+            return
+
+    # Step 3: Ask for calories target
+    if step == "ask_calories_target":
+        try:
+            calories = float(user_text)
+        except ValueError:
+            await update.message.reply_text(
+                "I need a *number only* for calories, champ 🔢\n" "Example: `2200`",
+                parse_mode="Markdown",
+            )
+            return
+
+        data["calories_target"] = calories
+        context.user_data["registration_step"] = "ask_protein_target"
+
+        await update.message.reply_text(
+            "Got it 🔥\n\n"
+            "Now send your *daily protein target* in grams as a **number only**.\n"
+            "Example: `150`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Step 4: Ask for protein target and create profile
+    if step == "ask_protein_target":
+        try:
+            protein = float(user_text)
+        except ValueError:
+            await update.message.reply_text(
+                "I need a *number only* for protein, in grams 🔢\n" "Example: `150`",
+                parse_mode="Markdown",
+            )
+            return
+
+        data["protein_target"] = protein
+
+        # Create the profile row in Google Sheets
+        name = data.get("name", "champ")
+        calories_target = data["calories_target"]
+        protein_target = data["protein_target"]
+
+        logger.info(
+            "Creating profile for chat_id=%s name=%s calories=%s protein=%s",
+            chat_id,
+            name,
+            calories_target,
+            protein_target,
+        )
+
+        create_profile(
+            user_id=chat_id,
+            name=name,
+            calories_target=calories_target,
+            protein_target=protein_target,
+        )
+
+        # Clear registration state & switch to main mode
+        context.user_data.clear()
+        context.user_data["mode"] = "main"
+
+        await update.message.reply_text(
+            "Awesome, champ 💪\n\n"
+            f"Your nutrition targets are locked in:\n"
+            f"🔥 *{int(calories_target)}* kcal\n"
+            f"🍗 *{int(protein_target)}* g protein\n\n"
+            "From now on you can:\n"
+            "• Send me meal descriptions or photos to log your food 🥗\n"
+            "• Ask for a *daily report* to see your progress 📊\n"
+            "• Later, we’ll let you update your targets any time.\n\n"
+            "Whenever you're ready, tell me about your next meal!",
+            parse_mode="Markdown",
+        )
+        
+        return
 
 
 async def main_nutrition_agent(
