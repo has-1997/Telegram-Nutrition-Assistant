@@ -258,7 +258,7 @@ Provide a short description of the meal and the macro estimates."""
         else:
             # Fallback to parsing text if parsed is not available
             data = json.loads(response.text)
-        
+
         meal_description = str(data.get("meal_description", "")).strip()
         calories = float(data.get("calories", 0))
         proteins = float(data.get("proteins", 0))
@@ -276,6 +276,190 @@ Provide a short description of the meal and the macro estimates."""
         "carbs": carbs,
         "fats": fats,
     }
+
+
+def plan_nutrition_action(message_text: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Inputs:
+        message_text: what the user said (typed or transcribed).
+        profile: dict from Google Sheets with keys like Name, Calories_target, Protein_target.
+    Returns:
+        A dict describing what to do. Example shapes:
+
+        {
+          "action": "append_meal",
+          "meal": {
+            "description": "Chicken with rice and vegetables",
+            "calories": 620,
+            "proteins": 45,
+            "carbs": 70,
+            "fats": 15
+          },
+          "reply": "Logged your chicken and rice meal, nice job!"
+        }
+
+        {
+          "action": "update_profile",
+          "profile_updates": {
+            "Calories_target": 2300,
+            "Protein_target": 170
+          },
+          "reply": "Updated your daily targets to 2300 kcal and 170 g protein."
+        }
+
+        {
+          "action": "get_report",
+          "report_date": "2025-01-01",
+          "reply": "Here is your report for 2025-01-01:"
+        }
+
+        {
+          "action": "chat",
+          "reply": "Short coaching-style answer..."
+        }
+
+    Purpose:
+        Let Gemini act as the 'brain' that decides how to interpret a user's message.
+        Uses structured output to ensure valid JSON response.
+    """
+    client = _get_client()
+
+    name = str(profile.get("Name", "champ"))
+    calories_target = profile.get("Calories_target", None)
+    protein_target = profile.get("Protein_target", None)
+
+    profile_summary = f"Name: {name}."
+    if calories_target is not None and protein_target is not None:
+        profile_summary += (
+            f" Daily targets: {calories_target} kcal and {protein_target} g protein."
+        )
+
+    prompt = f"""You are Cal AI, a friendly but efficient nutrition coach bot.
+
+User profile:
+{profile_summary}
+
+You will receive ONE message from the user. It might:
+- Describe a meal they just ate (with or without macros).
+- Ask to update their calorie/protein targets.
+- Ask for a daily report (e.g. "show me today's report" or "report for 2025-01-01").
+- Ask a general nutrition question.
+
+Your job:
+1. Decide ONE main action: "append_meal", "update_profile", "get_report", or "chat".
+2. If action == "append_meal":
+   - Build a meal object with:
+     - description (short)
+     - calories, proteins, carbs, fats (numbers, rough estimates if needed).
+3. If action == "update_profile":
+   - Build profile_updates with keys like "Calories_target" and "Protein_target"
+     if the user clearly asked to change them.
+4. If action == "get_report":
+   - Choose report_date:
+     - If they mention a specific date, use 'YYYY-MM-DD' format.
+     - If they say things like "today" or "tonight", use "today".
+     - If unclear, use "today".
+5. Always include a short, friendly coaching reply in "reply".
+
+Rules:
+- Use ONLY one action per response.
+- If something is not needed, you can omit that field or set it to null.
+- Numbers must NOT be in quotes.
+
+User message: {message_text}"""
+
+    # Define the JSON schema for structured output
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["append_meal", "update_profile", "get_report", "chat"],
+                "description": "The main action to take"
+            },
+            "meal": {
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "Short description of the meal"
+                    },
+                    "calories": {
+                        "type": "integer",
+                        "description": "Estimated calories"
+                    },
+                    "proteins": {
+                        "type": "integer",
+                        "description": "Estimated grams of protein"
+                    },
+                    "carbs": {
+                        "type": "integer",
+                        "description": "Estimated grams of carbohydrates"
+                    },
+                    "fats": {
+                        "type": "integer",
+                        "description": "Estimated grams of fats"
+                    }
+                },
+                "required": ["description", "calories", "proteins", "carbs", "fats"]
+            },
+            "profile_updates": {
+                "type": "object",
+                "properties": {
+                    "Calories_target": {
+                        "type": "integer",
+                        "description": "New daily calorie target"
+                    },
+                    "Protein_target": {
+                        "type": "integer",
+                        "description": "New daily protein target in grams"
+                    }
+                }
+            },
+            "report_date": {
+                "type": "string",
+                "description": "Date for the report in 'YYYY-MM-DD' format or 'today'"
+            },
+            "reply": {
+                "type": "string",
+                "description": "Short, friendly coaching reply message for the user"
+            }
+        },
+        "required": ["action", "reply"]
+    }
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=response_schema,
+        ),
+    )
+
+    try:
+        # Use the parsed response if available (structured output)
+        if response.parsed and isinstance(response.parsed, dict):
+            data = response.parsed
+        else:
+            # Fallback to parsing text if parsed is not available
+            data = json.loads(response.text)
+        
+        if not isinstance(data, dict):
+            raise ValueError("Parsed JSON is not an object")
+        
+        # Ensure at least action + reply exist
+        action = data.get("action") or "chat"
+        reply = data.get("reply") or "Got it!"
+        data["action"] = action
+        data["reply"] = reply
+        return data
+    except (KeyError, ValueError, json.JSONDecodeError, AttributeError):
+        # Fallback: just treat it as a chat message
+        return {
+            "action": "chat",
+            "reply": "I understand! Let me help you with that.",
+        }
 
 
 if __name__ == "__main__":
