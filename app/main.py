@@ -19,55 +19,157 @@ from sheets_helpers import (
     get_profile_by_user_id,
     create_profile,
     append_meal_row,
+    get_meals_for_date,
+    update_profile_fields,
 )
 from gemini_helpers import (
     estimate_calorie_and_protein_targets,
     transcribe_voice_message,
     analyze_meal_image,
+    plan_nutrition_action,
 )
 from media_helpers import (
     download_voice_file,
     download_photo_file,
 )
 
-# Set up basic logging so we can see what's happening in the terminal
+# -------------------------------------------------
+# Logging & config
+# -------------------------------------------------
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# Load variables from the .env file
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 
 def today_str() -> str:
-    """
-    Inputs: none.
-    Returns: today's date as 'YYYY-MM-DD'.
-    Purpose: use a consistent date format for meal logging.
-    """
+    """Return today's date as 'YYYY-MM-DD' (UTC)."""
     return datetime.utcnow().strftime("%Y-%m-%d")
 
 
-# --------------------- COMMAND HANDLER ---------------------
+# -------------------------------------------------
+# Daily report helper
+# -------------------------------------------------
+
+
+def build_daily_report_message(chat_id: int | str, date_str: str) -> str:
+    """
+    Inputs:
+        chat_id: Telegram chat ID.
+        date_str: 'YYYY-MM-DD'.
+    Returns:
+        A human-friendly summary of that day's meals vs targets.
+    """
+    profile = get_profile_by_user_id(chat_id)
+    if profile is None:
+        return (
+            "I couldn’t find your profile for this report 🤔\n"
+            "Try sending /start again so I can set you up."
+        )
+
+    meals = get_meals_for_date(chat_id, date_str)
+    name = profile.get("Name") or "champ"
+
+    if not meals:
+        return (
+            f"📅 Daily report for *{date_str}* – *{name}*\n\n"
+            "You haven’t logged any meals for this day yet.\n"
+            "Send me photos or descriptions of what you eat and I’ll track everything for you 💪"
+        )
+
+    total_calories = 0.0
+    total_proteins = 0.0
+    total_carbs = 0.0
+    total_fats = 0.0
+
+    lines = []
+    for row in meals:
+        desc = str(row.get("Meal_description", "Meal")).strip()
+        try:
+            cals = float(row.get("Calories", 0) or 0)
+            prot = float(row.get("Proteins", 0) or 0)
+            carbs = float(row.get("Carbs", 0) or 0)
+            fats = float(row.get("Fats", 0) or 0)
+        except (TypeError, ValueError):
+            cals = prot = carbs = fats = 0.0
+
+        total_calories += cals
+        total_proteins += prot
+        total_carbs += carbs
+        total_fats += fats
+
+        lines.append(
+            f"• {desc} — {int(cals)} kcal, {int(prot)} g P, {int(carbs)} g C, {int(fats)} g F"
+        )
+
+    try:
+        target_cal = float(profile.get("Calories_target") or 0)
+    except (TypeError, ValueError):
+        target_cal = 0.0
+
+    try:
+        target_prot = float(profile.get("Protein_target") or 0)
+    except (TypeError, ValueError):
+        target_prot = 0.0
+
+    def progress_bar(total: float, target: float) -> str:
+        if target <= 0:
+            return "No target set."
+        ratio = max(0.0, min(total / target, 2.0))  # cap at 200%
+        pct = int(round(ratio * 100))
+        bar_len = 20
+        filled = int(round(min(bar_len, max(0, ratio * bar_len))))
+        bar = "█" * filled + "░" * (bar_len - filled)
+        return f"{bar} {pct}%"
+
+    calories_line = "🔥 Calories: "
+    if target_cal > 0:
+        calories_line += f"{int(total_calories)}/{int(target_cal)} kcal\n"
+        calories_line += progress_bar(total_calories, target_cal)
+    else:
+        calories_line += f"{int(total_calories)} kcal (no target set)"
+
+    protein_line = "🍗 Protein: "
+    if target_prot > 0:
+        protein_line += f"{int(total_proteins)}/{int(target_prot)} g\n"
+        protein_line += progress_bar(total_proteins, target_prot)
+    else:
+        protein_line += f"{int(total_proteins)} g (no target set)"
+
+    header = f"📅 Daily report for *{date_str}* – *{name}*\n"
+    meals_block = "\n".join(lines)
+
+    msg = (
+        f"{header}\n"
+        "Logged meals:\n"
+        f"{meals_block}\n\n"
+        f"{calories_line}\n\n"
+        f"{protein_line}\n\n"
+        f"Carbs: {int(total_carbs)} g\n"
+        f"Fats: {int(total_fats)} g\n\n"
+        "Keep going, legend 💪"
+    )
+    return msg
+
+
+# -------------------------------------------------
+# /start handler
+# -------------------------------------------------
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Behavior:
-        - When user sends /start, check if they already have a profile.
-        - If not, send them into the registration flow.
-        - If yes, greet them as a returning athlete.
-    """
     chat_id = update.effective_chat.id
     logger.info("Received /start from chat_id=%s", chat_id)
 
     profile = get_profile_by_user_id(chat_id)
 
     if profile is None:
-        # New user: invite them to register
+        # New user → registration
         context.user_data.clear()
         context.user_data["mode"] = "registration"
         context.user_data["registration_step"] = "ask_name"
@@ -81,7 +183,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode="Markdown",
         )
     else:
-        # Returning user: greet them with their name if we have it
+        # Existing user
         name = profile.get("Name") or "champ"
         context.user_data.clear()
         context.user_data["mode"] = "main"
@@ -95,18 +197,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-# --------------------- TEXT ROUTING ---------------------
+# -------------------------------------------------
+# Text routing
+# -------------------------------------------------
 
 
 async def handle_text_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """
-    Behavior:
-        - Runs for every non-command text message.
-        - Looks up the user in the Profile sheet.
-        - Routes to either the registration assistant or the main nutrition agent.
-    """
     if update.message is None:
         return
 
@@ -117,30 +215,21 @@ async def handle_text_message(
     profile = get_profile_by_user_id(chat_id)
 
     if profile is None:
-        # Not registered yet → go to registration assistant
         context.user_data.setdefault("mode", "registration")
         await registration_assistant(update, context)
     else:
-        # Already registered → go to main nutrition agent
         context.user_data["mode"] = "main"
         await main_nutrition_agent(update, context, profile, user_text)
 
 
-# --------------------- VOICE ROUTING (with Gemini) ---------------------
+# -------------------------------------------------
+# Voice routing (with Gemini)
+# -------------------------------------------------
 
 
 async def handle_voice_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """
-    Behavior:
-        - Runs when the user sends a voice message.
-        - If not registered → ask them to run /start.
-        - If registered:
-            - Download the audio file.
-            - Send it to Gemini to get a text transcription.
-            - Pass that text to the main nutrition agent as if user typed it.
-    """
     if update.message is None:
         return
 
@@ -158,7 +247,6 @@ async def handle_voice_message(
         )
         return
 
-    # Download the voice note locally
     local_path = await download_voice_file(update, context)
     if local_path is None:
         await update.message.reply_text(
@@ -167,7 +255,6 @@ async def handle_voice_message(
         )
         return
 
-    # Ask Gemini to turn audio into text
     try:
         transcribed_text = transcribe_voice_message(
             audio_path=local_path,
@@ -188,7 +275,6 @@ async def handle_voice_message(
         )
         return
 
-    # Now treat the transcribed text just like a normal message
     logger.info(
         "Transcribed VOICE from chat_id=%s into TEXT: %s",
         chat_id,
@@ -198,22 +284,14 @@ async def handle_voice_message(
     await main_nutrition_agent(update, context, profile, transcribed_text)
 
 
-# --------------------- PHOTO ROUTING (with Gemini meal analysis) ---------------------
+# -------------------------------------------------
+# Photo routing (image → macros + log meal)
+# -------------------------------------------------
 
 
 async def handle_photo_message(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """
-    Behavior:
-        - Runs when the user sends a photo.
-        - If not registered → ask them to run /start.
-        - If registered:
-            - Download the photo.
-            - Ask Gemini to analyze the meal and estimate macros.
-            - Log a new row in the Meals sheet for today.
-            - Reply with a summary of what was logged.
-    """
     if update.message is None:
         return
 
@@ -231,7 +309,6 @@ async def handle_photo_message(
         )
         return
 
-    # 1) Download the photo locally
     local_path = await download_photo_file(update, context)
     if local_path is None:
         await update.message.reply_text(
@@ -240,11 +317,10 @@ async def handle_photo_message(
         )
         return
 
-    # 2) Ask Gemini to analyze the image
     try:
         analysis = analyze_meal_image(
             image_path=local_path,
-            mime_type="image/jpeg",  # Telegram photos are usually JPEG
+            mime_type="image/jpeg",
         )
     except Exception as e:
         logger.exception("Error while analyzing meal image: %s", e)
@@ -255,12 +331,11 @@ async def handle_photo_message(
         return
 
     meal_description = analysis.get("meal_description", "Meal")
-    calories = float(analysis.get("calories", 0))
-    proteins = float(analysis.get("proteins", 0))
-    carbs = float(analysis.get("carbs", 0))
-    fats = float(analysis.get("fats", 0))
+    calories = float(analysis.get("calories", 0) or 0)
+    proteins = float(analysis.get("proteins", 0) or 0)
+    carbs = float(analysis.get("carbs", 0) or 0)
+    fats = float(analysis.get("fats", 0) or 0)
 
-    # 3) Log the meal in the Meals sheet with today's date
     date_str = today_str()
     logger.info(
         "Logging meal from photo for chat_id=%s on %s: %s (kcal=%.1f, P=%.1f, C=%.1f, F=%.1f)",
@@ -291,7 +366,6 @@ async def handle_photo_message(
         )
         return
 
-    # 4) Reply to the user with a friendly summary
     reply_text = (
         "🍽 Meal logged from your photo!\n\n"
         f"Description: {meal_description}\n"
@@ -302,30 +376,17 @@ async def handle_photo_message(
         "I’ve added this to today’s log.\n"
         "You can ask me for a *daily report* any time to see your totals 📊"
     )
-
     await update.message.reply_text(reply_text, parse_mode="Markdown")
 
 
-# --------------------- REGISTRATION ASSISTANT ---------------------
+# -------------------------------------------------
+# Registration assistant (unchanged from before)
+# -------------------------------------------------
 
 
 async def registration_assistant(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """
-    Behavior:
-        Step-based registration flow:
-        - ask_name → store name
-        - ask_know_targets → do they already know calories/protein?
-        - if yes:
-            - ask_calories_target → numeric calories
-            - ask_protein_target → numeric protein, then create profile
-        - if no:
-            - ask_weight → kg
-            - ask_height → cm
-            - ask_age → years
-            - ask_goal → text; use Gemini to estimate targets and create profile
-    """
     if update.message is None:
         return
 
@@ -382,7 +443,6 @@ async def registration_assistant(
 
     # ----- PATH A: USER KNOWS TARGETS -----
 
-    # Step 3A: Ask for calories target
     if step == "ask_calories_target":
         try:
             calories = float(user_text)
@@ -404,7 +464,6 @@ async def registration_assistant(
         )
         return
 
-    # Step 4A: Ask for protein target and create profile
     if step == "ask_protein_target":
         try:
             protein = float(user_text)
@@ -417,7 +476,6 @@ async def registration_assistant(
 
         data["protein_target"] = protein
 
-        # Create the profile row in Google Sheets
         name = data.get("name", "champ")
         calories_target = data["calories_target"]
         protein_target = data["protein_target"]
@@ -437,7 +495,6 @@ async def registration_assistant(
             protein_target=protein_target,
         )
 
-        # Clear registration state & switch to main mode
         context.user_data.clear()
         context.user_data["mode"] = "main"
 
@@ -457,7 +514,6 @@ async def registration_assistant(
 
     # ----- PATH B: USER DOES NOT KNOW TARGETS (USE GEMINI) -----
 
-    # Step 3B: Ask for weight
     if step == "ask_weight":
         try:
             weight = float(user_text)
@@ -477,7 +533,6 @@ async def registration_assistant(
         )
         return
 
-    # Step 4B: Ask for height
     if step == "ask_height":
         try:
             height = float(user_text)
@@ -497,7 +552,6 @@ async def registration_assistant(
         )
         return
 
-    # Step 5B: Ask for age
     if step == "ask_age":
         try:
             age = int(user_text)
@@ -522,12 +576,10 @@ async def registration_assistant(
         )
         return
 
-    # Step 6B: Ask for goal, call Gemini, create profile
     if step == "ask_goal":
         goal_text = user_text.lower()
         data["goal_raw"] = goal_text
 
-        # Normalize the goal into one of three categories for the prompt
         if "gain" in goal_text or "bulk" in goal_text or "muscle" in goal_text:
             goal_norm = "gain muscle"
         elif "lose" in goal_text or "cut" in goal_text or "fat" in goal_text:
@@ -545,7 +597,6 @@ async def registration_assistant(
             parse_mode="Markdown",
         )
 
-        # Ask Gemini for calorie & protein targets
         calories_target, protein_target = estimate_calorie_and_protein_targets(
             weight_kg=weight,
             height_cm=height,
@@ -575,7 +626,6 @@ async def registration_assistant(
             protein_target=protein_target,
         )
 
-        # Clear registration state & switch to main mode
         context.user_data.clear()
         context.user_data["mode"] = "main"
 
@@ -594,7 +644,9 @@ async def registration_assistant(
         return
 
 
-# --------------------- MAIN NUTRITION AGENT (still simple) ---------------------
+# -------------------------------------------------
+# Main nutrition agent using Gemini planner
+# -------------------------------------------------
 
 
 async def main_nutrition_agent(
@@ -604,56 +656,157 @@ async def main_nutrition_agent(
     message_text: str,
 ) -> None:
     """
-    Behavior (for now):
-        - Confirms we’re in the main nutrition side.
-        - Shows the text it thinks the user sent (typed or transcribed).
-    Later:
-        - Will log meals, update targets, and show daily reports.
+    Behavior:
+        - Ask Gemini what to do with the message (append_meal, update_profile, get_report, chat).
+        - Call the right helper functions.
+        - Reply to the user with a friendly message.
     """
-    name = profile.get("Name") or "champ"
-    await update.message.reply_text(
-        f"🏋️ Main nutrition coach here, *{name}*.\n\n"
-        "Here’s the message I’m working with:\n"
-        f"“{message_text}”\n\n"
-        "(Soon I’ll turn messages like this into logged meals, profile updates, or reports.)",
-        parse_mode="Markdown",
-    )
+    chat_id = update.effective_chat.id
+    plan = plan_nutrition_action(message_text, profile)
+
+    action = plan.get("action", "chat")
+    reply = plan.get("reply", "")
+
+    # --- Append meal from text ---
+    if action == "append_meal":
+        meal = plan.get("meal") or {}
+        desc = meal.get("description") or "Meal"
+        try:
+            calories = float(meal.get("calories", 0) or 0)
+            proteins = float(meal.get("proteins", 0) or 0)
+            carbs = float(meal.get("carbs", 0) or 0)
+            fats = float(meal.get("fats", 0) or 0)
+        except (TypeError, ValueError):
+            calories = proteins = carbs = fats = 0.0
+
+        date_str = today_str()
+
+        logger.info(
+            "Logging meal (text) for chat_id=%s on %s: %s (kcal=%.1f, P=%.1f, C=%.1f, F=%.1f)",
+            chat_id,
+            date_str,
+            desc,
+            calories,
+            proteins,
+            carbs,
+            fats,
+        )
+
+        append_meal_row(
+            user_id=chat_id,
+            date_str=date_str,
+            meal_description=desc,
+            calories=calories,
+            proteins=proteins,
+            carbs=carbs,
+            fats=fats,
+        )
+
+        if not reply:
+            reply = "Nice, I’ve logged that meal for you 💪"
+
+        reply += (
+            f"\n\nLogged: {desc}\n"
+            f"🔥 ~{int(calories)} kcal, "
+            f"🍗 ~{int(proteins)} g P, "
+            f"🍞 ~{int(carbs)} g C, "
+            f"🥑 ~{int(fats)} g F"
+        )
+        await update.message.reply_text(reply, parse_mode="Markdown")
+        return
+
+    # --- Update profile targets ---
+    if action == "update_profile":
+        raw_updates = plan.get("profile_updates") or {}
+        normalized_updates: Dict[str, Any] = {}
+
+        for key, value in raw_updates.items():
+            if key is None:
+                continue
+            k = str(key).lower()
+            if k in {"calories_target", "calories", "kcal"}:
+                try:
+                    normalized_updates["Calories_target"] = float(value)
+                except (TypeError, ValueError):
+                    pass
+            elif k in {"protein_target", "proteins", "protein"}:
+                try:
+                    normalized_updates["Protein_target"] = float(value)
+                except (TypeError, ValueError):
+                    pass
+
+        if normalized_updates:
+            update_profile_fields(chat_id, normalized_updates)
+            logger.info(
+                "Updated profile for chat_id=%s with %s",
+                chat_id,
+                normalized_updates,
+            )
+            if not reply:
+                parts = []
+                if "Calories_target" in normalized_updates:
+                    parts.append(f"{int(normalized_updates['Calories_target'])} kcal")
+                if "Protein_target" in normalized_updates:
+                    parts.append(
+                        f"{int(normalized_updates['Protein_target'])} g protein"
+                    )
+                joined = " and ".join(parts)
+                reply = f"Updated your daily targets to {joined} 💪"
+
+            await update.message.reply_text(reply, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                "I wasn’t fully sure how to update your targets from that message 🤔\n"
+                "Try saying something like: “Set my calories to 2300 and protein to 170g.”",
+                parse_mode="Markdown",
+            )
+        return
+
+    # --- Daily report ---
+    if action == "get_report":
+        date_token = plan.get("report_date", "today")
+        if isinstance(date_token, str):
+            token_lower = date_token.lower().strip()
+            if token_lower in {"today", "tonight", "now"}:
+                date_str = today_str()
+            else:
+                # Assume the model already gave 'YYYY-MM-DD'
+                date_str = date_token.strip()
+        else:
+            date_str = today_str()
+
+        report_message = build_daily_report_message(chat_id, date_str)
+        await update.message.reply_text(report_message, parse_mode="Markdown")
+        return
+
+    # --- Chat / default ---
+    if not reply:
+        reply = (
+            "Got it! If you tell me what you ate, I can log it, "
+            "or you can ask me for a daily report 📊"
+        )
+    await update.message.reply_text(reply, parse_mode="Markdown")
 
 
-# --------------------- APP ENTRY POINT ---------------------
+# -------------------------------------------------
+# App entry point
+# -------------------------------------------------
 
 
 def main() -> None:
-    """
-    Behavior:
-        - Checks for the bot token
-        - Creates the Telegram application
-        - Registers handlers (text, voice, photo)
-        - Starts long polling (listening for messages)
-    """
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is missing from your .env file")
 
-    # Build the bot application
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # /start command
     application.add_handler(CommandHandler("start", start))
-
-    # Text messages (not commands)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
-
-    # Voice messages
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
-
-    # Photo messages
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
 
-    print(
-        "✅ Cal AI bot is running with text + voice (transcribed) + photo meal logging."
-    )
+    print("✅ Cal AI bot is running with Gemini-powered actions + daily reports.")
     application.run_polling()
 
 
