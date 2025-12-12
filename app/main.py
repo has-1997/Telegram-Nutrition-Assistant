@@ -32,6 +32,10 @@ from media_helpers import (
     download_voice_file,
     download_photo_file,
 )
+from markdown_utils import (
+    escape_markdown_v2,
+    chunk_for_telegram,
+)
 
 # -------------------------------------------------
 # Logging & config
@@ -50,6 +54,18 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 def today_str() -> str:
     """Return today's date as 'YYYY-MM-DD' (UTC)."""
     return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+async def send_markdown(update: Update, text: str) -> None:
+    """
+    Inputs:
+        update: Telegram update (we use update.message.reply_text).
+        text: full Markdown-formatted message.
+    Behavior:
+        Splits the text into chunks ≤ 4000 chars and sends each one.
+    """
+    for chunk in chunk_for_telegram(text, max_len=4000):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
 
 # -------------------------------------------------
@@ -73,11 +89,13 @@ def build_daily_report_message(chat_id: int | str, date_str: str) -> str:
         )
 
     meals = get_meals_for_date(chat_id, date_str)
-    name = profile.get("Name") or "champ"
+    name_raw = profile.get("Name") or "champ"
+    name = escape_markdown_v2(name_raw)
+    date_safe = escape_markdown_v2(date_str)
 
     if not meals:
         return (
-            f"📅 Daily report for *{date_str}* – *{name}*\n\n"
+            f"📅 Daily report for *{date_safe}* – *{name}*\n\n"
             "You haven’t logged any meals for this day yet.\n"
             "Send me photos or descriptions of what you eat and I’ll track everything for you 💪"
         )
@@ -89,7 +107,8 @@ def build_daily_report_message(chat_id: int | str, date_str: str) -> str:
 
     lines = []
     for row in meals:
-        desc = str(row.get("Meal_description", "Meal")).strip()
+        desc_raw = str(row.get("Meal_description", "Meal")).strip()
+        desc = escape_markdown_v2(desc_raw)
         try:
             cals = float(row.get("Calories", 0) or 0)
             prot = float(row.get("Proteins", 0) or 0)
@@ -141,7 +160,7 @@ def build_daily_report_message(chat_id: int | str, date_str: str) -> str:
     else:
         protein_line += f"{int(total_proteins)} g (no target set)"
 
-    header = f"📅 Daily report for *{date_str}* – *{name}*\n"
+    header = f"📅 Daily report for *{date_safe}* – *{name}*\n"
     meals_block = "\n".join(lines)
 
     msg = (
@@ -175,26 +194,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data["registration_step"] = "ask_name"
         context.user_data["registration_data"] = {}
 
-        await update.message.reply_text(
+        text = (
             "🔥 Welcome to *Cal AI* – your nutrition assistant!\n\n"
             "Looks like this is your first time here.\n"
             "Let’s set up your profile so I can coach you properly.\n\n"
-            "First question: what’s your *first name*, champ? 💪",
-            parse_mode="Markdown",
+            "First question: what’s your *first name*, champ? 💪"
         )
+        await send_markdown(update, text)
     else:
         # Existing user
-        name = profile.get("Name") or "champ"
+        name_raw = profile.get("Name") or "champ"
+        name = escape_markdown_v2(name_raw)
         context.user_data.clear()
         context.user_data["mode"] = "main"
 
-        await update.message.reply_text(
+        text = (
             f"Welcome back, *{name}* 💪\n\n"
             "You’re already registered.\n"
             "Send me meal descriptions, photos, or voice messages, "
-            "or ask for a daily report.",
-            parse_mode="Markdown",
+            "or ask for a daily report."
         )
+        await send_markdown(update, text)
 
 
 # -------------------------------------------------
@@ -330,7 +350,8 @@ async def handle_photo_message(
         )
         return
 
-    meal_description = analysis.get("meal_description", "Meal")
+    meal_description_raw = analysis.get("meal_description", "Meal")
+    meal_description = escape_markdown_v2(meal_description_raw)
     calories = float(analysis.get("calories", 0) or 0)
     proteins = float(analysis.get("proteins", 0) or 0)
     carbs = float(analysis.get("carbs", 0) or 0)
@@ -341,7 +362,7 @@ async def handle_photo_message(
         "Logging meal from photo for chat_id=%s on %s: %s (kcal=%.1f, P=%.1f, C=%.1f, F=%.1f)",
         chat_id,
         date_str,
-        meal_description,
+        meal_description_raw,
         calories,
         proteins,
         carbs,
@@ -352,7 +373,7 @@ async def handle_photo_message(
         append_meal_row(
             user_id=chat_id,
             date_str=date_str,
-            meal_description=meal_description,
+            meal_description=meal_description_raw,
             calories=calories,
             proteins=proteins,
             carbs=carbs,
@@ -376,11 +397,11 @@ async def handle_photo_message(
         "I’ve added this to today’s log.\n"
         "You can ask me for a *daily report* any time to see your totals 📊"
     )
-    await update.message.reply_text(reply_text, parse_mode="Markdown")
+    await send_markdown(update, reply_text)
 
 
 # -------------------------------------------------
-# Registration assistant (unchanged from before)
+# Registration assistant
 # -------------------------------------------------
 
 
@@ -400,12 +421,13 @@ async def registration_assistant(
         data["name"] = user_text
         context.user_data["registration_step"] = "ask_know_targets"
 
-        await update.message.reply_text(
-            f"Nice to meet you, {data['name']} 😎\n\n"
+        name = escape_markdown_v2(data["name"])
+        text = (
+            f"Nice to meet you, {name} 😎\n\n"
             "Do you already know your daily *calorie* and *protein* targets?\n"
-            "Reply with **yes** or **no**.",
-            parse_mode="Markdown",
+            "Reply with **yes** or **no**."
         )
+        await send_markdown(update, text)
         return
 
     # Step 2: Ask if they know their targets
@@ -415,30 +437,28 @@ async def registration_assistant(
             data["knows_targets"] = True
             context.user_data["registration_step"] = "ask_calories_target"
 
-            await update.message.reply_text(
+            text = (
                 "Awesome 🔥\n\n"
                 "Please send your *daily calorie target* as a **number only**.\n"
-                "Example: `2200`",
-                parse_mode="Markdown",
+                "Example: `2200`"
             )
+            await send_markdown(update, text)
             return
         elif text_lower in {"no", "n", "nope", "nah"}:
             data["knows_targets"] = False
             context.user_data["registration_step"] = "ask_weight"
 
-            await update.message.reply_text(
+            text = (
                 "No problem at all 💪\n\n"
                 "I’ll help you *calculate* good targets based on your stats.\n\n"
                 "First, what’s your *weight in kg*?\n"
-                "Example: `75`",
-                parse_mode="Markdown",
+                "Example: `75`"
             )
+            await send_markdown(update, text)
             return
         else:
-            await update.message.reply_text(
-                "Please reply with **yes** or **no** so I know whether you already have targets 😊",
-                parse_mode="Markdown",
-            )
+            text = "Please reply with **yes** or **no** so I know whether you already have targets 😊"
+            await send_markdown(update, text)
             return
 
     # ----- PATH A: USER KNOWS TARGETS -----
@@ -447,50 +467,47 @@ async def registration_assistant(
         try:
             calories = float(user_text)
         except ValueError:
-            await update.message.reply_text(
-                "I need a *number only* for calories, champ 🔢\n" "Example: `2200`",
-                parse_mode="Markdown",
-            )
+            text = "I need a *number only* for calories, champ 🔢\n" "Example: `2200`"
+            await send_markdown(update, text)
             return
 
         data["calories_target"] = calories
         context.user_data["registration_step"] = "ask_protein_target"
 
-        await update.message.reply_text(
+        text = (
             "Got it 🔥\n\n"
             "Now send your *daily protein target* in grams as a **number only**.\n"
-            "Example: `150`",
-            parse_mode="Markdown",
+            "Example: `150`"
         )
+        await send_markdown(update, text)
         return
 
     if step == "ask_protein_target":
         try:
             protein = float(user_text)
         except ValueError:
-            await update.message.reply_text(
-                "I need a *number only* for protein, in grams 🔢\n" "Example: `150`",
-                parse_mode="Markdown",
-            )
+            text = "I need a *number only* for protein, in grams 🔢\n" "Example: `150`"
+            await send_markdown(update, text)
             return
 
         data["protein_target"] = protein
 
-        name = data.get("name", "champ")
+        name_raw = data.get("name", "champ")
+        name = escape_markdown_v2(name_raw)
         calories_target = data["calories_target"]
         protein_target = data["protein_target"]
 
         logger.info(
             "Creating profile (manual targets) for chat_id=%s name=%s calories=%s protein=%s",
             chat_id,
-            name,
+            name_raw,
             calories_target,
             protein_target,
         )
 
         create_profile(
             user_id=chat_id,
-            name=name,
+            name=name_raw,
             calories_target=calories_target,
             protein_target=protein_target,
         )
@@ -498,7 +515,7 @@ async def registration_assistant(
         context.user_data.clear()
         context.user_data["mode"] = "main"
 
-        await update.message.reply_text(
+        text = (
             "Awesome, champ 💪\n\n"
             f"Your nutrition targets are locked in:\n"
             f"🔥 *{int(calories_target)}* kcal\n"
@@ -507,9 +524,9 @@ async def registration_assistant(
             "• Send me meal descriptions or photos to log your food 🥗\n"
             "• Ask for a *daily report* to see your progress 📊\n"
             "• Update your targets any time.\n\n"
-            "Whenever you're ready, tell me about your next meal!",
-            parse_mode="Markdown",
+            "Whenever you're ready, tell me about your next meal!"
         )
+        await send_markdown(update, text)
         return
 
     # ----- PATH B: USER DOES NOT KNOW TARGETS (USE GEMINI) -----
@@ -518,62 +535,52 @@ async def registration_assistant(
         try:
             weight = float(user_text)
         except ValueError:
-            await update.message.reply_text(
-                "I need a *number only* for your weight in kg 🔢\n" "Example: `75`",
-                parse_mode="Markdown",
-            )
+            text = "I need a *number only* for your weight in kg 🔢\n" "Example: `75`"
+            await send_markdown(update, text)
             return
 
         data["weight_kg"] = weight
         context.user_data["registration_step"] = "ask_height"
 
-        await update.message.reply_text(
-            "Nice ⚖️\n\n" "What’s your *height in cm*?\n" "Example: `180`",
-            parse_mode="Markdown",
-        )
+        text = "Nice ⚖️\n\n" "What’s your *height in cm*?\n" "Example: `180`"
+        await send_markdown(update, text)
         return
 
     if step == "ask_height":
         try:
             height = float(user_text)
         except ValueError:
-            await update.message.reply_text(
-                "I need a *number only* for your height in cm 🔢\n" "Example: `180`",
-                parse_mode="Markdown",
-            )
+            text = "I need a *number only* for your height in cm 🔢\n" "Example: `180`"
+            await send_markdown(update, text)
             return
 
         data["height_cm"] = height
         context.user_data["registration_step"] = "ask_age"
 
-        await update.message.reply_text(
-            "Got it 📏\n\n" "How old are you (in *years*)?\n" "Example: `28`",
-            parse_mode="Markdown",
-        )
+        text = "Got it 📏\n\n" "How old are you (in *years*)?\n" "Example: `28`"
+        await send_markdown(update, text)
         return
 
     if step == "ask_age":
         try:
             age = int(user_text)
         except ValueError:
-            await update.message.reply_text(
-                "I need a *whole number* for your age in years 🔢\n" "Example: `28`",
-                parse_mode="Markdown",
-            )
+            text = "I need a *whole number* for your age in years 🔢\n" "Example: `28`"
+            await send_markdown(update, text)
             return
 
         data["age_years"] = age
         context.user_data["registration_step"] = "ask_goal"
 
-        await update.message.reply_text(
+        text = (
             "Perfect 🎯\n\n"
             "Finally, what’s your main goal?\n"
             "You can say things like:\n"
             "• gain muscle\n"
             "• lose fat\n"
-            "• maintain\n",
-            parse_mode="Markdown",
+            "• maintain\n"
         )
+        await send_markdown(update, text)
         return
 
     if step == "ask_goal":
@@ -591,11 +598,11 @@ async def registration_assistant(
         height = float(data["height_cm"])
         age = int(data["age_years"])
 
-        await update.message.reply_text(
+        text = (
             "Love that goal 🙌\n\n"
-            "Give me a second while I calculate smart daily targets for you… 🤖",
-            parse_mode="Markdown",
+            "Give me a second while I calculate smart daily targets for you… 🤖"
         )
+        await send_markdown(update, text)
 
         calories_target, protein_target = estimate_calorie_and_protein_targets(
             weight_kg=weight,
@@ -604,13 +611,13 @@ async def registration_assistant(
             goal=goal_norm,
         )
 
-        name = data.get("name", "champ")
+        name_raw = data.get("name", "champ")
 
         logger.info(
             "Creating profile (Gemini targets) for chat_id=%s name=%s "
             "weight=%.2f height=%.2f age=%d goal=%s calories=%.2f protein=%.2f",
             chat_id,
-            name,
+            name_raw,
             weight,
             height,
             age,
@@ -621,7 +628,7 @@ async def registration_assistant(
 
         create_profile(
             user_id=chat_id,
-            name=name,
+            name=name_raw,
             calories_target=calories_target,
             protein_target=protein_target,
         )
@@ -629,7 +636,7 @@ async def registration_assistant(
         context.user_data.clear()
         context.user_data["mode"] = "main"
 
-        await update.message.reply_text(
+        text = (
             "Targets calculated and locked in, legend 💪\n\n"
             f"Here’s what I recommend based on your stats and goal:\n"
             f"🔥 *{int(calories_target)}* kcal per day\n"
@@ -638,9 +645,9 @@ async def registration_assistant(
             "• Send me meal descriptions or photos to log your food 🥗\n"
             "• Ask for a *daily report* to see your progress 📊\n"
             "• Update your targets any time as things change.\n\n"
-            "Whenever you're ready, tell me about your next meal!",
-            parse_mode="Markdown",
+            "Whenever you're ready, tell me about your next meal!"
         )
+        await send_markdown(update, text)
         return
 
 
@@ -665,12 +672,16 @@ async def main_nutrition_agent(
     plan = plan_nutrition_action(message_text, profile)
 
     action = plan.get("action", "chat")
-    reply = plan.get("reply", "")
+    reply_raw = plan.get("reply", "") or ""
+
+    # Escape the AI reply so any special characters don't break Markdown
+    reply = escape_markdown_v2(reply_raw)
 
     # --- Append meal from text ---
     if action == "append_meal":
         meal = plan.get("meal") or {}
-        desc = meal.get("description") or "Meal"
+        desc_raw = meal.get("description") or "Meal"
+        desc = escape_markdown_v2(desc_raw)
         try:
             calories = float(meal.get("calories", 0) or 0)
             proteins = float(meal.get("proteins", 0) or 0)
@@ -685,7 +696,7 @@ async def main_nutrition_agent(
             "Logging meal (text) for chat_id=%s on %s: %s (kcal=%.1f, P=%.1f, C=%.1f, F=%.1f)",
             chat_id,
             date_str,
-            desc,
+            desc_raw,
             calories,
             proteins,
             carbs,
@@ -695,15 +706,15 @@ async def main_nutrition_agent(
         append_meal_row(
             user_id=chat_id,
             date_str=date_str,
-            meal_description=desc,
+            meal_description=desc_raw,
             calories=calories,
             proteins=proteins,
             carbs=carbs,
             fats=fats,
         )
 
-        if not reply:
-            reply = "Nice, I’ve logged that meal for you 💪"
+        if not reply.strip():
+            reply = escape_markdown_v2("Nice, I’ve logged that meal for you 💪")
 
         reply += (
             f"\n\nLogged: {desc}\n"
@@ -712,7 +723,7 @@ async def main_nutrition_agent(
             f"🍞 ~{int(carbs)} g C, "
             f"🥑 ~{int(fats)} g F"
         )
-        await update.message.reply_text(reply, parse_mode="Markdown")
+        await send_markdown(update, reply)
         return
 
     # --- Update profile targets ---
@@ -742,7 +753,7 @@ async def main_nutrition_agent(
                 chat_id,
                 normalized_updates,
             )
-            if not reply:
+            if not reply.strip():
                 parts = []
                 if "Calories_target" in normalized_updates:
                     parts.append(f"{int(normalized_updates['Calories_target'])} kcal")
@@ -750,16 +761,15 @@ async def main_nutrition_agent(
                     parts.append(
                         f"{int(normalized_updates['Protein_target'])} g protein"
                     )
-                joined = " and ".join(parts)
-                reply = f"Updated your daily targets to {joined} 💪"
-
-            await update.message.reply_text(reply, parse_mode="Markdown")
+                joined = ", ".join(parts)
+                reply = escape_markdown_v2(f"Updated your daily targets to {joined} 💪")
+            await send_markdown(update, reply)
         else:
-            await update.message.reply_text(
+            text = (
                 "I wasn’t fully sure how to update your targets from that message 🤔\n"
-                "Try saying something like: “Set my calories to 2300 and protein to 170g.”",
-                parse_mode="Markdown",
+                "Try saying something like: “Set my calories to 2300 and protein to 170g.”"
             )
+            await send_markdown(update, text)
         return
 
     # --- Daily report ---
@@ -770,22 +780,21 @@ async def main_nutrition_agent(
             if token_lower in {"today", "tonight", "now"}:
                 date_str = today_str()
             else:
-                # Assume the model already gave 'YYYY-MM-DD'
                 date_str = date_token.strip()
         else:
             date_str = today_str()
 
         report_message = build_daily_report_message(chat_id, date_str)
-        await update.message.reply_text(report_message, parse_mode="Markdown")
+        await send_markdown(update, report_message)
         return
 
     # --- Chat / default ---
-    if not reply:
-        reply = (
+    if not reply.strip():
+        reply = escape_markdown_v2(
             "Got it! If you tell me what you ate, I can log it, "
             "or you can ask me for a daily report 📊"
         )
-    await update.message.reply_text(reply, parse_mode="Markdown")
+    await send_markdown(update, reply)
 
 
 # -------------------------------------------------
@@ -806,7 +815,9 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
 
-    print("✅ Cal AI bot is running with Gemini-powered actions + daily reports.")
+    print(
+        "✅ Cal AI bot is running with Gemini-powered actions + daily reports + Markdown helpers."
+    )
     application.run_polling()
 
 
