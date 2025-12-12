@@ -60,12 +60,13 @@ async def send_markdown(update: Update, text: str) -> None:
     """
     Inputs:
         update: Telegram update (we use update.message.reply_text).
-        text: full Markdown-formatted message.
+        text: full MarkdownV2-formatted message.
     Behavior:
-        Splits the text into chunks ≤ 4000 chars and sends each one.
+        Splits the text into chunks ≤ 4000 chars and sends each one
+        using Telegram's MarkdownV2 mode.
     """
     for chunk in chunk_for_telegram(text, max_len=4000):
-        await update.message.reply_text(chunk, parse_mode="Markdown")
+        await update.message.reply_text(chunk, parse_mode="MarkdownV2")
 
 
 # -------------------------------------------------
